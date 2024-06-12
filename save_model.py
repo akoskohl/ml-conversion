@@ -16,8 +16,21 @@ flags.DEFINE_string('model', 'yolov4', 'yolov3 or yolov4')
 def save_tf():
   STRIDES, ANCHORS, NUM_CLASS, XYSCALE = utils.load_config(FLAGS)
 
-  input_layer = tf.keras.layers.Input([FLAGS.input_size, FLAGS.input_size, 3])
-  feature_maps = YOLO(input_layer, NUM_CLASS, FLAGS.model, FLAGS.tiny)
+  # input_layer = tf.keras.layers.Input([FLAGS.input_size, FLAGS.input_size, 3])
+  # feature_maps = YOLO(input_layer, NUM_CLASS, FLAGS.model, FLAGS.tiny)
+
+  # Accept a (base64-encoded) string as input.
+  input_layer = tf.keras.Input(name='image_bytes', shape=[], dtype=tf.string)
+
+  # Define a lambda layer to preprocess the base64-encoded input.
+  b64_to_numpy = tf.keras.layers.Lambda(map_fn, dtype=tf.string)
+
+  # Define the input_layer as input for the lambda layer.
+  preprocessed_image = b64_to_numpy(input_layer)
+
+  # Pass the preprocessed image into the convolutional layers.
+  feature_maps = YOLO(preprocessed_image, NUM_CLASS, FLAGS.model, FLAGS.tiny)
+
   bbox_tensors = []
   prob_tensors = []
   if FLAGS.tiny:
@@ -44,11 +57,39 @@ def save_tf():
     pred = (pred_bbox, pred_prob)
   else:
     boxes, pred_conf = filter_boxes(pred_bbox, pred_prob, score_threshold=FLAGS.score_thres, input_shape=tf.constant([FLAGS.input_size, FLAGS.input_size]))
-    pred = tf.concat([boxes, pred_conf], axis=-1)
-  model = tf.keras.Model(input_layer, pred)
+    # pred = tf.concat([boxes, pred_conf], axis=-1)
+
+    boxes, scores, classes, valid_detections = tf.image.combined_non_max_suppression(
+        boxes=tf.reshape(boxes, (tf.shape(boxes)[0], -1, 1, 4)),
+        scores=tf.reshape(pred_conf, (tf.shape(pred_conf)[0], -1, tf.shape(pred_conf)[-1])),
+        max_output_size_per_class=20,
+        max_total_size=20,
+        score_threshold=FLAGS.score_thres,
+    )
+    boxes = tf.identity(boxes, name="boxes")
+    classes = tf.identity(classes, name="classes")
+    scores = tf.identity(scores, name="scores")
+
+  # model = tf.keras.Model(input_layer, pred)
+  model = tf.keras.Model(input_layer, [boxes, classes, scores])
   utils.load_weights(model, FLAGS.weights, FLAGS.model, FLAGS.tiny)
   model.summary()
   model.save(FLAGS.output)
+
+def jpeg_decode_fn(img):
+    """Convert a decoded base64 string to a resized jpeg."""
+    return (tf.image.resize(
+        tf.image.decode_jpeg(img, channels=3),
+        (FLAGS.input_size, FLAGS.input_size),
+        method=tf.image.ResizeMethod.BILINEAR
+    )) / 255.
+
+def map_fn(img):
+    """Decode the web-safe base64-encoded string and pass it on to the jpeg_decode_fn function."""
+    return tf.cast(
+        tf.map_fn(jpeg_decode_fn, tf.io.decode_base64(img), dtype=tf.float32),
+        dtype=tf.float32
+    )
 
 def main(_argv):
   save_tf()
